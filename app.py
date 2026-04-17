@@ -1,4 +1,4 @@
-from flask import Flask, Response
+from flask import Flask, Response, request, jsonify
 import pyrealsense2 as rs
 import numpy as np
 import cv2
@@ -25,13 +25,14 @@ align = rs.align(rs.stream.color)
 
 rgb_frame_data = None
 depth_frame_data = None
+raw_depth_data = None
 lock = threading.Lock()
 
 running = True
 
 
 def camera_loop():
-    global rgb_frame_data, depth_frame_data, running
+    global rgb_frame_data, depth_frame_data, raw_depth_data, running
 
     while running:
         try:
@@ -48,15 +49,22 @@ def camera_loop():
             color_image = np.asanyarray(color_frame.get_data())
 
             # Depth frame → colorized for browser display
+            # Raw depth frame
             depth_image = np.asanyarray(depth_frame.get_data())
+
+            # Better scaling for visible range
+            depth_scaled = cv2.convertScaleAbs(depth_image, alpha=0.08)
+
+            # Depth colormap for display
             depth_colormap = cv2.applyColorMap(
-                cv2.convertScaleAbs(depth_image, alpha=0.08),
+                depth_scaled,
                 cv2.COLORMAP_JET
             )
 
             with lock:
                 rgb_frame_data = color_image.copy()
                 depth_frame_data = depth_colormap.copy()
+                raw_depth_data = depth_image.copy()
 
         except Exception as e:
             print("Camera loop error:", e)
@@ -99,6 +107,35 @@ def rgb_feed():
 def depth_feed():
     return Response(generate_mjpeg("depth"),
                     mimetype='multipart/x-mixed-replace; boundary=frame')
+
+@app.route("/depth_value")
+def depth_value():
+    global raw_depth_data
+
+    try:
+        x = int(request.args.get("x", 0))
+        y = int(request.args.get("y", 0))
+
+        with lock:
+            if raw_depth_data is None:
+                return jsonify({"error": "No depth frame available"}), 503
+
+            h, w = raw_depth_data.shape
+
+            if x < 0 or x >= w or y < 0 or y >= h:
+                return jsonify({"error": "Coordinates out of bounds"}), 400
+
+            depth_mm = int(raw_depth_data[y, x])
+            distance_m = round(depth_mm / 1000.0, 3)
+
+        return jsonify({
+            "x": x,
+            "y": y,
+            "distance_m": distance_m
+        })
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route("/")
