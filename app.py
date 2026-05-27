@@ -1,4 +1,5 @@
 from flask import Flask, Response, request, jsonify
+from flask_cors import CORS
 from ultralytics import YOLO
 import pyrealsense2 as rs
 import numpy as np
@@ -7,13 +8,15 @@ import threading
 import time
 
 app = Flask(__name__)
-
+CORS(app)
 # ==========================
 # YOLO CONFIG
 # ==========================
 
-WEIGHT_PATH = "combine.pt"
+WEIGHT_PATH = r"C:\Users\akash\Desktop\beach_robot\Code\dashboard\camera-server\combine.pt"
 model = YOLO(WEIGHT_PATH)
+YOLO_IMGSZ = 480
+YOLO_CONF = 0.5
 
 TARGET_LABELS = ['bottle', 'metal-can', 'paper-cup']
 PERSON_LABELS = ['person']
@@ -21,6 +24,8 @@ PERSON_LABELS = ['person']
 print("Loading YOLO model...")
 model = YOLO(WEIGHT_PATH)
 print("Model loaded successfully")
+print(model.names)
+
 
 # ==========================
 # RealSense Camera Setup
@@ -42,6 +47,25 @@ rgb_frame_data = None
 detection_frame_data = None
 depth_frame_data = None
 raw_depth_data = None
+
+detection_stats = {
+    "bottle": 0,
+    "metal-can": 0,
+    "paper-cup": 0,
+    "person": 0
+}
+
+robot_stats = {
+    "battery": 82,
+    "speed": 0.0,
+    "heading": 127,
+    "mode": "AUTONOMOUS",
+    "gps_fix": True,
+    "connected": True
+}
+
+last_detection_log_time = 0
+
 lock = threading.Lock()
 
 running = True
@@ -64,7 +88,7 @@ def get_median_depth(depth_frame, x1, y1, x2, y2):
     return np.median(depth_values)
 
 def camera_loop():
-    global rgb_frame_data, depth_frame_data, raw_depth_data, running
+    global rgb_frame_data, depth_frame_data, detection_frame_data, raw_depth_data, running, frame_detection_stats, last_detection_log_time
 
     while running:
         try:
@@ -85,11 +109,18 @@ def camera_loop():
                 frame,
                 imgsz=YOLO_IMGSZ,
                 conf=YOLO_CONF,
-                verbose=False
+                verbose=False,
+                device="cpu"
             )[0]
 
             vis = frame.copy()
 
+            frame_detection_stats = {
+                "bottle": 0,
+                "metal-can": 0,
+                "paper-cup": 0,
+                "person": 0
+            }
             # Process detections
             if results.boxes is not None:
                 boxes = results.boxes.xyxy.cpu().numpy()
@@ -104,6 +135,9 @@ def camera_loop():
                     # Only allowed classes
                     if label not in TARGET_LABELS and label not in PERSON_LABELS:
                         continue
+                    
+                    if label in frame_detection_stats:
+                        frame_detection_stats[label] += 1
 
                     # Clamp
                     x1 = max(0, x1)
@@ -113,6 +147,12 @@ def camera_loop():
 
                     # Median depth
                     distance = get_median_depth(depth_frame, x1, y1, x2, y2)
+
+                    current_time = time.time()
+
+                    if current_time - last_detection_log_time > 2:
+                        print(f"[DETECTION] {label} detected at {distance:.2f}m")
+                        last_detection_log_time = current_time
 
                     # Color
                     if label in PERSON_LABELS:
@@ -153,8 +193,17 @@ def camera_loop():
             )
 
             with lock:
+                global detection_stats
+
+                detection_stats = frame_detection_stats.copy()
+                
                 rgb_frame_data = frame.copy()
-                detection_frame_data = vis.copy()
+                
+                if vis is not None:
+                    detection_frame_data = vis.copy()
+                else :
+                    detection_frame_data = frame.copy()
+                
                 depth_frame_data = depth_colormap.copy()
                 raw_depth_data = depth_image.copy()
 
@@ -164,7 +213,9 @@ def camera_loop():
 
 
 def generate_mjpeg(feed_type="rgb"):
-    global rgb_frame_data, depth_frame_data
+    global rgb_frame_data 
+    global depth_frame_data
+    global detection_frame_data
 
     while True:
         frame = None
@@ -172,8 +223,13 @@ def generate_mjpeg(feed_type="rgb"):
         with lock:
             if feed_type == "rgb" and rgb_frame_data is not None:
                 frame = rgb_frame_data.copy()
-            elif feed_type =="detection" and detection_frame_data is not None:
-                frame = detection_frame_data.copy()
+
+            elif feed_type =="detection":
+                if detection_frame_data is not None:
+                    frame = detection_frame_data.copy()
+                elif rgb_frame_data is not None:
+                    frame = rgb_frame_data.copy()
+                    
             elif feed_type == "depth" and depth_frame_data is not None:
                 frame = depth_frame_data.copy()
 
@@ -196,18 +252,17 @@ def rgb_feed():
     return Response(generate_mjpeg("rgb"),
                     mimetype='multipart/x-mixed-replace; boundary=frame')
 
-
-@app.route("/depth")
-def depth_feed():
-    return Response(generate_mjpeg("depth"),
-                    mimetype='multipart/x-mixed-replace; boundary=frame')
-
 @app.route("/detection")
 def detection_feed():
     return Response(
         generate_mjpeg("detection"),
         mimetype='multipart/x-mixed-replace; boundary=frame'
     )
+
+@app.route("/depth")
+def depth_feed():
+    return Response(generate_mjpeg("depth"),
+                    mimetype='multipart/x-mixed-replace; boundary=frame')
 
 @app.route("/depth_value")
 def depth_value():
@@ -237,7 +292,17 @@ def depth_value():
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+    
+@app.route("/stats")
+def stats():
+    global detection_stats
+    global robot_stats
 
+    with lock:
+        return jsonify({
+            "detections": detection_stats,
+            "robot": robot_stats
+        })
 
 @app.route("/")
 def index():
@@ -246,6 +311,8 @@ def index():
     <ul>
         <li><a href="/rgb">RGB Feed</a></li>
         <li><a href="/depth">Depth Feed</a></li>
+        <li><a href="/detection">Detection Feed</a></li>
+        <li><a href="/stats">Statistics</a></li>
     </ul>
     """
 
